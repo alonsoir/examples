@@ -31,7 +31,6 @@ import org.apache.kafka.common.utils.Utils;
 import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
@@ -44,6 +43,9 @@ import java.util.Set;
  * deleting all internally created topics, and deleting local state stores.
  */
 public class StreamsCleanupClient {
+    private static final int EXIT_CODE_SUCCESS = 0;
+    private static final int EXIT_CODE_ERROR = 1;
+
     private static OptionSpec<String> bootstrapServerOption;
     private static OptionSpec<String> zookeeperOption;
     private static OptionSpec<String> applicationIdOption;
@@ -56,7 +58,7 @@ public class StreamsCleanupClient {
     public void run(final String[] args) {
         ZkUtils zkUtils = null;
 
-        int exitCode = 0;
+        int exitCode = EXIT_CODE_SUCCESS;
         try {
             parseArguments(args);
 
@@ -72,7 +74,7 @@ public class StreamsCleanupClient {
             deleteInternalTopics(zkUtils, allTopics);
             removeLocalStateStore();
         } catch (final Exception e) {
-            exitCode = -1;
+            exitCode = EXIT_CODE_ERROR;
             System.err.println(e.getMessage());
         } finally {
             if (zkUtils != null) {
@@ -86,32 +88,34 @@ public class StreamsCleanupClient {
         final OptionParser optionParser = new OptionParser();
         applicationIdOption = optionParser.accepts("application-id", "The Kafka Streams application ID (application.id)")
             .withRequiredArg()
-            .describedAs("id")
             .ofType(String.class)
+            .describedAs("id")
             .required();
         bootstrapServerOption = optionParser.accepts("bootstrap-server", "Format: <host:port>")
             .withRequiredArg()
-            .describedAs("url")
+            .ofType(String.class)
             .defaultsTo("localhost:9092")
-            .ofType(String.class);
+            .describedAs("url");
         zookeeperOption = optionParser.accepts("zookeeper", "Format: <host:port>")
             .withRequiredArg()
-            .describedAs("url")
+            .ofType(String.class)
             .defaultsTo("localhost:2181")
-            .ofType(String.class);
+            .describedAs("url");
         sourceTopicsOption = optionParser.accepts("source-topics", "Comma separated list of user source topics")
             .withRequiredArg()
-            .describedAs("list")
-            .ofType(String.class);
+            .ofType(String.class)
+            .withValuesSeparatedBy(',')
+            .describedAs("list");
         intermediateTopicsOption = optionParser.accepts("intermediate-topics", "Comma separated list of intermediate user topics")
             .withRequiredArg()
-            .describedAs("list")
-            .ofType(String.class);
+            .ofType(String.class)
+            .withValuesSeparatedBy(',')
+            .describedAs("list");
         stateDirOption = optionParser.accepts("state-dir", "Local state store directory (state.dir)")
             .withRequiredArg()
-            .describedAs("dir")
+            .ofType(String.class)
             .defaultsTo("/var/lib/kafka-streams")
-            .ofType(String.class);
+            .describedAs("dir");
 
         try {
             this.options = optionParser.parse(args);
@@ -122,16 +126,14 @@ public class StreamsCleanupClient {
     }
 
     private void resetSourceTopicOffsets() {
-        final List<String> topics = new LinkedList<>();
-        topics.addAll(this.options.valuesOf(sourceTopicsOption));
-        topics.addAll(this.options.valuesOf(intermediateTopicsOption));
+        final List<String> sourceTopics = this.options.valuesOf(sourceTopicsOption);
 
-        if (topics.size() == 0) {
-            System.out.println("No source or intermediate topics specified.");
+        if (sourceTopics.size() == 0) {
+            System.out.println("No source topics specified.");
             return;
         }
 
-        System.out.println("Resetting offsets to zero for topics " + topics);
+        System.out.println("Resetting offsets to zero for topics " + sourceTopics);
 
         final Properties config = new Properties();
         config.setProperty(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, this.options.valueOf(bootstrapServerOption));
@@ -140,7 +142,7 @@ public class StreamsCleanupClient {
 
         final KafkaConsumer<byte[], byte[]> client = new KafkaConsumer<>(config, new ByteArrayDeserializer(), new ByteArrayDeserializer());
         try {
-            client.subscribe(topics);
+            client.subscribe(sourceTopics);
             client.poll(1);
 
             for (final TopicPartition partition : client.assignment()) {
@@ -148,7 +150,7 @@ public class StreamsCleanupClient {
             }
             client.commitSync();
         } catch (final RuntimeException e) {
-            System.err.println("Resetting source topic offsets failed");
+            System.err.println("Resetting source topic offsets failed.");
             throw e;
         } finally {
             client.close();
@@ -194,10 +196,8 @@ public class StreamsCleanupClient {
     private void deleteInternalTopics(final ZkUtils zkUtils, final List<String> allTopics) {
         System.out.println("Deleting internal topics.");
 
-        final String applicationId = this.options.valueOf(applicationIdOption);
-
         for (final String topic : allTopics) {
-            if (topic.startsWith(applicationId + "-") && (topic.endsWith("-changelog") || topic.endsWith("-repartition"))) {
+            if (isInternalStreamsTopic(topic)) {
                 final TopicCommand.TopicCommandOptions commandOptions = new TopicCommand.TopicCommandOptions(new String[]{
                     "--zookeeper", this.options.valueOf(zookeeperOption),
                     "--delete", "--topic", topic});
@@ -213,20 +213,28 @@ public class StreamsCleanupClient {
         System.out.println("Done.");
     }
 
+    private boolean isInternalStreamsTopic(final String topicName) {
+        return topicName.startsWith(this.options.valueOf(applicationIdOption) + "-")
+            && (topicName.endsWith("-changelog") || topicName.endsWith("-repartition"));
+    }
+
     private void removeLocalStateStore() {
-        final File stateStore = new File(this.options.valueOf(stateDirOption) + File.separator + this.options.valueOf(applicationIdOption));
+        final String appId = this.options.valueOf(applicationIdOption);
+        final File stateStore = new File(this.options.valueOf(stateDirOption) + File.separator + appId);
         if (!stateStore.exists()) {
-            System.out.println("Nothing to clear. Local state store directory does not exist.");
+            System.out.println("Nothing to delete. Local state store directory does not exist.");
             return;
         }
+        final String stateStorePath = stateStore.getAbsolutePath();
         if (!stateStore.isDirectory()) {
-            System.err.println("ERROR: " + stateStore.getAbsolutePath() + " is not a directory.");
+            System.err.println("ERROR: " + stateStorePath + " is not a directory.");
             return;
         }
 
-        System.out.println("Removing local state store.");
+        System.out.println("Removing local Kafka Streams application data in " + stateStorePath
+            + " for application " + appId);
         Utils.delete(stateStore);
-        System.out.println("Deleted " + stateStore.getAbsolutePath());
+        System.out.println("Deleted " + stateStorePath);
     }
 
     public static void main(final String[] args) {
